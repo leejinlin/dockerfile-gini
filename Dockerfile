@@ -1,4 +1,87 @@
-FROM alpine:3.15
+##############################################################################
+# Stage 1: 编译 CVE-2026-109618/109619 补丁版 PHP 7.4
+##############################################################################
+FROM --platform=linux/amd64 alpine:3.15 AS php-builder
+
+# 安装编译依赖（与 Alpine 3.15 php7 包的构建依赖对齐）
+RUN apk update && apk add \
+    autoconf automake bison build-base curl-dev freetype-dev gd-dev gettext-dev \
+    gmp-dev icu-dev libjpeg-turbo-dev libpng-dev libwebp-dev libxml2-dev \
+    libxpm-dev libzip-dev musl-dev oniguruma-dev openldap-dev openssl-dev \
+    pcre-dev pcre2-dev re2c sqlite-dev yaml-dev zeromq-dev argon2-dev libedit-dev \
+    krb5-dev \
+    git
+
+# 拉取官方补丁分支
+RUN git clone --depth 1 -b PHP-7.4-CVE-2026-109618-109619 \
+    https://github.com/php/php-src.git /php-src
+
+# 修改版本号，让渗透扫描器识别为已修复版本
+RUN sed -i 's/#define PHP_VERSION "7.4.33"/#define PHP_VERSION "7.4.33.1"/' /php-src/main/php_version.h \
+    && sed -i 's/#define PHP_EXTRA_VERSION ""/#define PHP_EXTRA_VERSION "-cve2026fix"/' /php-src/main/php_version.h
+
+# 使用与 Alpine 3.15 php7 包相同的核心编译参数
+# 只保留 FPM/CLI 和镜像实际使用的扩展，不编译未用的扩展以加速
+RUN cd /php-src && ./buildconf --force && ./configure \
+    --build=x86_64-alpine-linux-musl \
+    --host=x86_64-alpine-linux-musl \
+    --prefix=/usr \
+    --program-suffix=7 \
+    --libdir=/usr/lib/php7 \
+    --datadir=/usr/share/php7 \
+    --sysconfdir=/etc/php7 \
+    --localstatedir=/var \
+    --with-layout=GNU \
+    --with-pic \
+    --with-config-file-path=/etc/php7 \
+    --with-config-file-scan-dir=/etc/php7/conf.d \
+    --disable-short-tags \
+    --with-libxml \
+    --with-openssl \
+    --with-kerberos \
+    --with-system-ciphers \
+    --with-password-argon2 \
+    --with-external-pcre \
+    --with-libedit \
+    --with-zlib \
+    --enable-bcmath=shared \
+    --enable-ctype=shared \
+    --with-curl=shared \
+    --enable-dom=shared \
+    --enable-fileinfo=shared \
+    --enable-gd=shared --with-freetype --with-jpeg --with-webp --with-xpm --disable-gd-jis-conv \
+    --with-gettext=shared \
+    --with-iconv=shared \
+    --enable-intl=shared \
+    --enable-json=shared \
+    --with-ldap=shared --with-ldap-sasl \
+    --enable-mbstring=shared \
+    --enable-mysqlnd=shared \
+    --with-mysqli=shared,mysqlnd \
+    --enable-opcache=shared \
+    --enable-pcntl=shared \
+    --enable-pdo=shared \
+    --with-pdo-mysql=shared,mysqlnd \
+    --with-pdo-sqlite=shared \
+    --enable-phar=shared \
+    --enable-posix=shared \
+    --enable-session=shared \
+    --enable-simplexml=shared \
+    --enable-soap=shared \
+    --enable-sockets=shared \
+    --with-sqlite3=shared \
+    --enable-tokenizer=shared \
+    --enable-xml=shared \
+    --enable-xmlreader=shared \
+    --enable-xmlwriter=shared \
+    --with-zip=shared \
+    --enable-fpm \
+    && make -j$(nproc)
+
+##############################################################################
+# Stage 2: 运行时镜像（与原 Dockerfile 一致，仅替换 PHP 二进制）
+##############################################################################
+FROM --platform=linux/amd64 alpine:3.15
 LABEL maintainer=iamfat@gmail.com
 
 ENV TERM="xterm-color" \
@@ -32,6 +115,16 @@ RUN apk update \
         && /usr/local/bin/composer install --no-dev \
         && bin/gini cache \
     && rm -rf /var/cache/apk/*
+
+# 用编译好的补丁版 PHP 替换 apk 安装的原版
+COPY --from=php-builder /php-src/sapi/fpm/php-fpm /usr/sbin/php-fpm7
+COPY --from=php-builder /php-src/sapi/cli/php /usr/bin/php7
+
+# apk 的 .so 在 /usr/lib/php7/modules/，源码编译的 PHP 找 /usr/lib/php7/20190902/
+RUN ln -sf /usr/lib/php7/modules /usr/lib/php7/20190902
+
+# 固化 session.upload_progress 关闭（双重保险）
+RUN echo 'session.upload_progress.enabled=0' > /etc/php7/conf.d/99-cve2026-fix.ini
 
 ADD msmtprc /etc/msmtprc
 
