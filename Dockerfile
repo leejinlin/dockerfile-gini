@@ -1,4 +1,81 @@
-FROM ubuntu:20.04
+##############################################################################
+# Stage 1: 编译 CVE-2026-109618/109619 补丁版 PHP 7.4 (Ubuntu/glibc)
+##############################################################################
+FROM --platform=linux/amd64 ubuntu:20.04 AS php-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 允许过期签名的仓库（Ubuntu 20.04 已 EOL，签名可能过期）
+RUN apt-get -q update -o Acquire::AllowInsecureRepositories=true \
+        -o Acquire::AllowDowngradeToInsecureRepositories=true 2>/dev/null; \
+    apt-get install -yq --allow-unauthenticated \
+        build-essential autoconf bison re2c git pkg-config \
+        libxml2-dev libssl-dev libcurl4-openssl-dev libpng-dev libjpeg-dev \
+        libfreetype6-dev libwebp-dev libxpm-dev libzip-dev libonig-dev \
+        libicu-dev libldap2-dev libsasl2-dev libsqlite3-dev libedit-dev \
+        libkrb5-dev libpcre2-dev libargon2-dev zlib1g-dev \
+    || true
+
+# 拉取官方补丁分支
+RUN git clone --depth 1 -b PHP-7.4-CVE-2026-109618-109619 \
+    https://github.com/php/php-src.git /php-src
+
+# 使用与 Ubuntu 20.04 php7.4 包对齐的编译参数
+RUN cd /php-src && ./buildconf --force && ./configure \
+    --prefix=/usr \
+    --with-config-file-path=/etc/php/7.4/cli \
+    --with-config-file-scan-dir=/etc/php/7.4/cli/conf.d \
+    --libdir=/usr/lib/php \
+    --datadir=/usr/share/php/7.4 \
+    --with-layout=GNU \
+    --with-pic \
+    --disable-short-tags \
+    --with-libxml \
+    --with-openssl \
+    --with-kerberos \
+    --with-system-ciphers \
+    --with-password-argon2 \
+    --with-external-pcre \
+    --with-libedit \
+    --with-zlib \
+    --enable-bcmath=shared \
+    --enable-ctype=shared \
+    --with-curl=shared \
+    --enable-dom=shared \
+    --enable-fileinfo=shared \
+    --enable-gd=shared --with-freetype --with-jpeg --with-webp --with-xpm --disable-gd-jis-conv \
+    --with-gettext=shared \
+    --with-iconv=shared \
+    --enable-intl=shared \
+    --enable-json=shared \
+    --with-ldap=shared --with-ldap-sasl \
+    --enable-mbstring=shared \
+    --enable-mysqlnd=shared \
+    --with-mysqli=shared,mysqlnd \
+    --enable-opcache=shared \
+    --enable-pcntl=shared \
+    --enable-pdo=shared \
+    --with-pdo-mysql=shared,mysqlnd \
+    --with-pdo-sqlite=shared \
+    --enable-phar=shared \
+    --enable-posix=shared \
+    --enable-session=shared \
+    --enable-simplexml=shared \
+    --enable-soap=shared \
+    --enable-sockets=shared \
+    --with-sqlite3=shared \
+    --enable-tokenizer=shared \
+    --enable-xml=shared \
+    --enable-xmlreader=shared \
+    --enable-xmlwriter=shared \
+    --with-zip=shared \
+    --enable-fpm \
+    && make -j$(nproc)
+
+##############################################################################
+# Stage 2: 运行时镜像（与原 Dockerfile 一致，仅替换 PHP 二进制）
+##############################################################################
+FROM --platform=linux/amd64 ubuntu:20.04
 LABEL maintainer=maintain@geneegroup.com
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -9,7 +86,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COMPOSER_PROCESS_TIMEOUT=40000 \
     APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1 \
     COMPOSER_HOME="/usr/local/share/composer"
-    
+
 RUN apt-get -q update && \
     # Install Locales
     apt-get install -yq locales gettext && \
@@ -38,7 +115,7 @@ RUN apt-get -q update && \
     apt-get -yq --purge autoremove software-properties-common && \
     apt-get -yq autoclean && apt-get -yq clean
 
-RUN apt-get install -yq git && \    
+RUN apt-get install -yq git && \
     # Install Composer
     mkdir -p /usr/local/bin && (curl -sL https://getcomposer.org/installer | php) && \
         mv composer.phar /usr/local/bin/composer && \
@@ -51,6 +128,17 @@ RUN apt-get install -yq git && \
     # Clean Up
     apt-get -yq --purge autoremove git && \
     apt-get -yq autoclean && apt-get -yq clean
+
+# 用编译好的补丁版 PHP 替换 apt 安装的原版
+COPY --from=php-builder /php-src/sapi/fpm/php-fpm /usr/sbin/php-fpm7.4
+COPY --from=php-builder /php-src/sapi/cli/php /usr/bin/php7.4
+
+# apt 的 .so 在 /usr/lib/php/20190902/，与源码编译的 extension_dir 一致，无需额外链接
+
+# 固化 session.upload_progress 关闭（双重保险，FPM 和 CLI 都生效）
+RUN echo 'session.upload_progress.enabled=0' > /etc/php/7.4/mods-available/cve2026-fix.ini \
+    && ln -sf /etc/php/7.4/mods-available/cve2026-fix.ini /etc/php/7.4/fpm/conf.d/99-cve2026-fix.ini \
+    && ln -sf /etc/php/7.4/mods-available/cve2026-fix.ini /etc/php/7.4/cli/conf.d/99-cve2026-fix.ini
 
 ADD msmtprc /etc/msmtprc
 
